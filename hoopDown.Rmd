@@ -1,0 +1,666 @@
+---
+title: "Clustering NBA Player Types: A Tutorial on K-Means, Model Based Clustering, and Graphical Networks"
+author: "Alex Stern | acs4wq@virginia.edu | Data Mining (SYS 6018) Final Project"
+# date: "12/8/2020"
+output: html_document
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+## Introduction
+This is a reproducible tutorial on identifying player and team types in the NBA. Standard player positions are extremely outdated and often carry little meaning when describing what a player will actually do when he/she steps on the court. The motivation behind this project is to identify new clusters of NBA players which better align with what our eyes see each night on the court. Teammates LeBron James and Anthony Davis are both technically forwards but are used in completely different ways. The NBA is transitioning towards a much more free-flowing style of play where centers are shooting 3-pointers with frequency and point guards are 6'7". Teams will have to start using more descriptive methods for identifying the types of players they wish to build their lineup around. 
+
+Multiple popular clustering algorithms will be described and implemented using phsyical characteristics of NBA players obtained from the NBA Combine, as well as on-court tendencies of players on both sides of the ball. This tutorial requires minimal background in statistics and R. It was developed for anyone with interest in either learning more about play styles in the NBA or sports analytics in general. Hopefully this can serve as a base for anyone who wants to learn some new things in R or get ideas about how to get creative with sports data. There will be some math for those interested but I'll try to keep it as light as possible.
+
+I'll be going over K-Means clustering, Principal Component Analysis, Model Based Clustering, and Networks/Graphs. I'll also do a fair amount of plotting and try to comment as many of the plotting functions as possible. Almost all of them allow for some level of customization which is always helpful to practice. Visualization is everything in a field where you have to spend a large amount of time generating buy-in to your statistical analysis. 
+
+## The Data
+The data used throughout this tutorial comes from the NBA's API and Basketball Reference (https://www.basketball-reference.com/). `nbastatR` is a package developed by Alex Bresler which scrapes from both of these sites. Documentation for the package and its functions can be found [here](http://asbcllc.com/nbastatR/index.html). 
+
+```{r warning=FALSE} 
+# install and load libraries
+# devtools::install_github("abresler/nbastatR")
+library("nbastatR")
+# if you don't have any of these, install using install.packages('package_name') 
+library(stats)
+library(mclust)
+library(mdthemes)
+library(gghighlight)
+library(factoextra)
+library(extrafont)
+# font_import(prompt=FALSE)
+loadfonts() 
+library(ggsci) 
+library(broom)
+library(igraph)
+library(tidyverse)
+```
+
+This function pulls data from Basketball Reference. The data frame will contain individual player stats on a per minute basis from each of the last ten seasons, as well as the total number of minutes played. This is only the data I wanted to grab for this project but there are dozens more features you can pull from this function yourself. 
+```{r warnings=FALSE, include=FALSE}
+# pull seasonal player data 
+START_YEAR <- 2010 # first year of data you want to pull
+END_YEAR <- 2020 # last year of data you want to pull
+player_stats <- nbastatR::bref_players_stats(seasons=START_YEAR:END_YEAR,
+                                   tables=c('totals', "per_minute"), # get totals and per minute stats
+                                   include_all_nba=FALSE,
+                                   only_totals=TRUE, nest_data=FALSE,
+                                   assign_to_environment=TRUE,
+                                   widen_data=TRUE, join_data=TRUE,
+                                   return_message=TRUE) %>%
+  # grab only the columns we want
+  dplyr::select(namePlayer, groupPosition, yearSeason, slugPosition, agePlayer, slugTeamBREF,
+                idPlayerNBA, minutesTotals, pctFG, pctFG3, pctFG2, pctEFG, pctFT, fgmPerMinute, 
+                fgaPerMinute, fg3mPerMinute, fg3aPerMinute, fg2mPerMinute, fg2aPerMinute, 
+                ftmPerMinute, ftaPerMinute, orbPerMinute, drbPerMinute, trbPerMinute, astPerMinute, 
+                stlPerMinute, blkPerMinute, tovPerMinute, pfPerMinute, ptsPerMinute)
+```
+
+Let's check out the distribution of total minutes our players played in each season.
+```{r} 
+# define personal theme for rules you want every graph to have (this saves time / space) 
+theme_stern <- function() {
+  theme(text = element_text(family='Tahoma', color="#232D4B"), # set font and color of all text
+        axis.title = element_text(face='bold'), # make all axis titles bold
+        plot.title = element_text(face='bold', hjust=0.5), # make all plot titles bold
+        legend.title = element_text(face='bold'), # make all legend titles bold
+        plot.subtitle = element_text(face='italic', hjust=0.5)) # make all subtitles italic
+}
+
+player_stats %>%
+  ggplot(aes(x=minutesTotals)) + 
+  geom_histogram(aes(y=..density..), position='identity', # generate histogram of data
+                 fill="#232D4B", alpha=0.9, bins=30) + 
+  geom_density(alpha=0.2, fill="#F84C1E", color="#F84C1E") + # generate kernel density estimate
+  labs(y = "Density", x = "Total Minutes Played", # assign axis titles
+       title = "Distribution of Total Minutes Played in a Season") + # assign plot title
+  scale_x_continuous(breaks=seq(-500, 3000, 500)) + # manually set x-axis ticks
+  theme_minimal() + theme_stern() + # apply themes
+  theme(axis.ticks.y = element_blank(), axis.text.y = element_blank(), # manually adjust theme
+        axis.text.x = element_text(size=10)) 
+```
+
+There looks to be a drop-off so lets only keep players' seasons in which they played at least $1000$ minutes, leaving us with ~$1500$ player seasons. This ensures player clusters will be representative of the types of players you see most frequently on an NBA court. 
+```{r}
+# subset data to players who played >1000 minutes in a season
+player_stats <- player_stats %>%
+  dplyr::filter(minutesTotals > 1000, idPlayerNBA!=1628977, idPlayerNBA!=1628998) # remove players who's ID repeats
+
+# vector of unique player IDs
+unique_playerIDs <- unique(player_stats$idPlayerNBA)
+```
+
+This function will pull data from the NBA Draft Combine. Again, there's way more than just what I'm pulling here so be sure to check it out yourself. 
+```{r warning=FALSE}
+# pull player heights from the NBA Draft Combine
+combine <- draft_combines(years=2000:2019,
+                          nest_data=FALSE, return_message=FALSE) %>%
+  # select only the columns we want 
+  dplyr::select(idPlayer, 
+                # heightWOShoesInches, weightLBS, wingspanInches, 
+                verticalLeapMaxInches, timeLaneAgility,
+                repsBenchPress135) %>%
+  # limit to players in the on-court stats dataset
+  dplyr::filter(idPlayer %in% unique_playerIDs) %>%
+  # rename ID column for merging purposes later
+  rename(c('idPlayerNBA'='idPlayer'))
+``` 
+
+## K-Means Clustering
+*K-Means* is an unsupervised clustering algorithm. Unsupervised means that it operates without the input of a response variable. Unlike a regression model or any type of prediction problem, K-Means is only concerned with groupings of various sizes based on the values of the predictors. The groupings are determined using the distances between observations, attempting to maximize the distance *between* clusters and minimize the distance *within* clusters. The most common distance formula used is *Euclidean* distance: 
+$$distance(a, b) = \sqrt{\sum^n_{i=1} (a_i - b_i)^2}$$
+This is the same straight-line distance formula you learned in Geometry class but allows the algorithm to work on any number of dimensions and therefore take into account any number of predictors. This also means that all predictors must be on the same scale. Scaling ensures that when distances are calculated, all dimensions have a mean of zero. While the mean of each predictor has been centered, the spread of each predictor remains intact. Predictor variables which are compact around their mean will have less influence over the distance calculation than those with a wider spread of potential values. In this example, if 3PT% is a more widely distributed skill than 2PT%, being better or worse at it will have a greater effect on the player's distance from other players. The function `scale()` scales quantitative predictors using the z-score formula for the normal distribution: 
+$$x_{new} = \frac{(x_i - \bar{x})}{\sigma_x}$$
+This tutorial will not cover them, but qualitative predictors can be used as well. It is suggested that qualitative predictors be normalized based on the moments of either the binomial or dirichlet distributions. The algorithm begins by taking in a pre-specified $k$ which dictates the number of clusters it should create. It places the centers of each of these clusters in random locations across $m$ dimensions, where $m$ is the number of predictor variables. From here the algorithm repeats the same two steps: 
+
+1. The distance from each observation to each center is calculated and observations are assigned to the cluster they are closest to. 
+2. Cluster centers are re-initialized to the mean value of each predictor variable for the observations assigned to the cluster. 
+
+These steps are repeated until no observation changes cluster membership in step (1) from its previous membership in the previous iteration. 
+
+The random nature of the beginning of the K-Means algorithm does mean that different clusters can be created using the same data and the same $k$. Improvements have been made in recent years and more robust algorithms for determining initial cluster centers have been developed. I won't get into those here but the most popular of these is *K-Means++* and more information on it can be found [here](https://en.wikipedia.org/wiki/K-means%2B%2B). 
+
+Since all predictors are scaled in the same way, the distance calculation makes all predictors equally important. Therefore, the selection of predictor variables makes all the difference when running K-Means. For this project, a mix of physical traits and on-court actions were used. Physical traits are extremely important in basketball. They help determine who you are able to defend, how you move around the court, and how physical you can be on offense. For shooting, a decision must be made to either use makes or attempts. I chose to use per minute player tendencies rather than results because they provide a better idea of what a player's game is. What is a player doing while they are on the court? Made shots will always be more noisy than attempts due to the luck involved in putting a ball into a hoop from $10$-$30$ (or $40$ if you're [Damian Lillard](https://www.youtube.com/watch?v=VX1AFPmCBAY)) feet away. Attempts also partially encompass talent due to the natual selection bias which occurs. Coach isn't going to let you take $25$+ shots a game if he/she doesn't think you're going to hit some of them. This decision should lead to groupings of players that make a lot of natural sense to frequent viewers of the game. Players in the same cluster will ideally be those with similar playing styles and have similar roles within their respective offenses and defenses. 
+
+### Physical Traits:
+
+* Vertical - *maximum vertical leap (in.)*
+* Agility - *lane agility test score (sec.)*
+* Strength - *number of 135lb bench press reps*
+
+### On-Court Tendencies
+
+* 3PA - *3-point shots attempted per minute*
+* 2PA - *2-point shoes attempted per minute*
+* FTA - *free throws attempted per minute (How often is this player drawing fouls while shooting?)*
+* ORB - *offensive rebounds per minute*
+* DRB - *defensive rebounds per minute*
+* AST - *assists per minute*
+* STL - *steals per minute*
+* BLK - *blocks per minute*
+* TOV - *turnovers per minute*
+* PTS - *total points scored per minute*
+* 3PT% - *percentage of 3-point shots made*
+* 2PT% - *percentage of 2-point shoes made*
+* FT% - *percentage of free throws made*
+```{r}
+# describe which stats were picked 
+player_stats <- player_stats %>%
+  # join player on-court stats with NBA combine metrics
+  inner_join(combine, by='idPlayerNBA') %>%
+  # remove players with NA values for Combine metrics 
+  dplyr::filter(# !is.na(heightWOShoesInches), !is.na(weightLBS), !is.na(wingspanInches), 
+    !is.na(verticalLeapMaxInches),
+                !is.na(timeLaneAgility), !is.na(repsBenchPress135)) 
+
+X <- player_stats %>% 
+  # select predictor variables define above
+  dplyr::select(pctFG3, pctFG2, pctFT, 
+                fg3aPerMinute, fg2aPerMinute, ftaPerMinute, 
+                orbPerMinute, drbPerMinute, astPerMinute, 
+                stlPerMinute, blkPerMinute, tovPerMinute, 
+                ptsPerMinute,  verticalLeapMaxInches, 
+                timeLaneAgility, repsBenchPress135
+                ) %>%
+  # scale data 
+  scale()
+```
+
+Since the K-Means algorithm fits only to the number of clusters specified, some testing must be done to find the optimal $k$. The optimal $k$ will do the best job at both ensuring observations within the same cluster are as similar as possible and observations in different clusters are as different as possible. Here I'll fit a K-Means algorithm for $1$ to $20$ clusters and save the total within sum of squares value from the model. This is a measure of how similar each of the observations within a cluster are. 
+```{r}
+set.seed(222) # set seed to ensure reproduceability b/c k-means relies on random states for initialization 
+MAX_K <- 20 # max number of clusters
+sse <- c() # vector to hold SSE of each model
+
+for (k in 1:MAX_K) {
+  algo_k <- kmeans(X, centers=k, nstart=22, iter.max=20) # k-means algorithm
+  sse <- c(sse, algo_k$tot.withinss) # get SSE
+} 
+```
+
+How does the total within cluster distance change as $k$ ranges from $1$ to $20$? 
+```{r}
+tibble(k = 1:MAX_K, SSE = sse) %>%
+  ggplot(aes(x=k, y=SSE)) + 
+  geom_point(color="#F84C1E") + geom_line(color="#232D4B") + # set color of point and lines
+  labs(x = "K", y = "SSE", title = "Where does this level off?") + # set axis/plot titles
+  scale_x_continuous(breaks=seq(1, MAX_K, 1)) + # define x-axis
+  theme_minimal() + theme_stern() + # add themes
+  theme(panel.grid.minor.x = element_blank(), panel.grid.minor.y = element_blank()) # manually alter theme
+```
+
+Looks like this dips between $9$ and $11$ but it can be tough to find the exact point where the above chart levels off. Another thing you can look at is the difference between the total within cluster distance of $k$ and $k+1$. Where does this chart level off? 
+```{r}
+tibble(k = 1:MAX_K, SSE_difference = sse-lead(sse)) %>%
+  dplyr::filter(k<MAX_K) %>%
+  ggplot(aes(x=k, y=SSE_difference)) + 
+  geom_point(color="#F84C1E") + geom_line(color="#232D4B") + # set color of point and lines
+  labs(x = "K", y = "SSE Rolling Difference", title = "A Clearer Picture") + # set axis/plot titles
+  scale_x_continuous(breaks=seq(1, MAX_K, 1)) + # define x-axis
+  theme_minimal() + theme_stern() + # add themes
+  theme(panel.grid.minor.x = element_blank(), panel.grid.minor.y = element_blank()) # manually alter theme
+```
+
+The one-unit rolling difference looks to level off around $8$ or $10$. Even more helpful can be the two-unit rolling difference. 
+```{r}
+tibble(k = 1:MAX_K, SSE_difference = sse-2*lead(sse)+lead(sse, 2)) %>%
+  dplyr::filter(k<MAX_K-1) %>%
+  ggplot(aes(x=k, y=SSE_difference)) + 
+  geom_point(color="#F84C1E") + geom_line(color="#232D4B") + 
+  labs(x = "K", y = "SSE Rolling 2-Unit Difference", title = "An Even Clearer Picture") + 
+  scale_x_continuous(breaks=seq(1, MAX_K, 1)) + 
+  theme_minimal() + theme_stern() + 
+  theme(panel.grid.minor.x = element_blank(), panel.grid.minor.y = element_blank())
+```
+
+Let's go with $10$ clusters but I encourage readers of this tutorial to experiment with different values of $k$ on their own. 
+```{r}
+set.seed(22)
+# re-run K-Means with 10 clusters
+K <- 10
+kmeans10 <- kmeans(X, centers=K, nstart=22, iter.max=20)
+km_centers <- as.data.frame(kmeans10$centers) # SCALED cluster centers/means
+
+# name clusters before pivoting
+km_centers$Cluster <- c('Cluster 1', 'Cluster 2', 'Cluster 3',
+                       'Cluster 4', 'Cluster 5', 'Cluster 6',
+                       'Cluster 7', 'Cluster 8', 'Cluster 9', 'Cluster 10') 
+# massage data
+km_centers <- km_centers %>%
+  rename(c('AST'='astPerMinute', 'BLK'='blkPerMinute', # give predictors a shorter name for plotting
+           'DRB'='drbPerMinute', '2PA'='fg2aPerMinute',
+           '3PA'='fg3aPerMinute', 'FTA'='ftaPerMinute',
+           'ORB'='orbPerMinute', 'PTS'='ptsPerMinute', 'STL'='stlPerMinute',
+           'TOV'='tovPerMinute', 'FT%'='pctFT', '2P%'='pctFG2', '3P%'='pctFG3',
+           'LEAP'='verticalLeapMaxInches', 'STR'='repsBenchPress135',
+           'AGL'='timeLaneAgility')) %>% 
+  pivot_longer(!Cluster, names_to = 'feature', values_to = 'z_val') # pivot data to make plotting easier
+
+# reset the order of predictor variables for plotting
+km_centers$feature <- factor(km_centers$feature, levels=c('PTS', 'AST', 'ORB', 'DRB', 
+                                                          'STL','BLK', 'TOV', '2PA', 
+                                                          '3PA', 'FTA','2P%', '3P%', 
+                                                          'FT%','LEAP', 'AGL', 'STR')) 
+
+# reset the order of clusters for plotting (cluster 10 would default to come after cluster 1 and before cluster 2)
+km_centers$Cluster <- factor(km_centers$Cluster, levels=c('Cluster 1', 'Cluster 2', 'Cluster 3', 'Cluster 4',
+                                                          'Cluster 5', 'Cluster 6', 'Cluster 7', 'Cluster 8',
+                                                          'Cluster 9', 'Cluster 10'))
+```
+
+Here's a look at the first cluster compared to the other nine. Notice how the cluster centers vary. 
+```{r}
+# plot cluster 1
+km_centers %>% 
+  ggplot(aes(x=feature, y=z_val, color=Cluster)) + 
+  geom_point(color="#232D4B") + # color points
+  gghighlight(Cluster=='Cluster 1', use_direct_label = FALSE) + # highlight cluster 1
+  labs(x = "Predictor", y = "Cluster Center",  # axis labels
+       title = "Visualizing K-Means Cluster Makeups", # plot title
+       subtitle = "Cluster 1") +  # plot subtitle
+  theme_minimal() + theme_stern() + # add themes
+  theme(legend.position = "none", # manually adjust themes
+        axis.text.x = element_text(angle=45, size=10))
+```
+
+You can see that this group of players scores more than the average number of points, mostly from 2-pointers and free throws. They rebound fairly well, but even better on defense. Physically, they're a tall, heavy, and strong bunch. Here's a few players from this past season who fit this build:
+```{r}
+tibble(cluster=kmeans10$cluster, name=player_stats$namePlayer, season=player_stats$yearSeason) %>%
+  dplyr::filter(cluster==1, season==2020) 
+```
+
+Here's how each of the K-Means clusters compare:
+```{r warning=FALSE}
+km_centers %>% 
+  ggplot(aes(x=feature, y=z_val, color=Cluster)) + 
+  geom_point() + # plot points
+  scale_color_brewer(palette="Paired") + # color points
+  gghighlight(use_direct_label = FALSE) + # highlight each cluster
+  facet_wrap(~ Cluster, ncol=3) + # create seperate plots for each cluster
+  labs(x = "Predictor", y = "Cluster Center", 
+       title = "Visualizing K-Means Cluster Makeups") + 
+  theme_minimal() + theme_stern() + 
+  theme(legend.position = "none", strip.text = element_text(face='bold'),
+        axis.text.x = element_text(angle=90, size=8), # alter axis text
+        panel.grid.minor = element_blank())
+```
+
+## Principal Component Analysis (PCA)
+PCA is an unsupervised dimensionality reduction technique. Like K-Means, it only works with predictor variables and doesn't take any sort of response variable into account. Dimensionality reduction refers to scaling your current data into as few dimensions as possible. This is done by essentially manufacturing new predictor variables, as few as possible. Each of these new variables, called Principal Components, is influenced to some degree by each of the original predictor variables. The components are created such that the greatest amount of variance within the original dataset can be explained by the first Principal Component (PC). The next component will account for as much of the remaining variance as possible, as so on. Often, the first few components explain almost all of the variance between observations across all original predictors. This is helpful becuase you have now reduced the number of dimensions you're working in, simplifying the modeling process. As well, all components are orthogonal. This means that they are all perfectly independent. Every component has a correlation coefficient of $0.00$ with each other component. While this isn't important for the purposes of this tutorial, it is an extremely nice property to have when doing any type of modeling, like regression. 
+
+```{r}
+pca <- prcomp(X) # perform Principle Component Analysis 
+pca_summary <- summary(pca) # summary of PCA model
+
+# plot % of variance between players explained by each subsequent PC 
+tibble(imp = pca_summary$importance[2,], n = 1:length(imp)) %>% # get importance scores for PCA summary
+  ggplot(aes(x=n, y=imp)) + 
+  labs(x = 'Principle Component #', y = '% of Variance Explained by Component',
+       title = 'Less Information is Gained by Each Subsequent PC') +
+  geom_point(color="#F84C1E") + geom_line(color="#232D4B") + 
+  theme_minimal() + scale_x_continuous(breaks=seq(1, 20, 1)) + # set x-axis
+  scale_y_continuous(labels=scales::percent) + # change y-axis from proportion to percentage
+  theme_stern() + 
+  theme(panel.grid.minor.x = element_blank(), panel.grid.minor.y = element_blank())
+```
+
+Combining PCA with K-Means allows you to visually examine the differences between clusters in the two dimensions that account for the majority of the variance between observations. Some are more compact and some are wider. As well, the number of players in each cluster is not equal and many will overlap due to the fact that you're only seeing the first two components. 
+```{r}
+pc2 <- as.data.frame(pca$x[,1:2]) # extract first two PCs
+pc2$Cluster <- as.factor(kmeans10$cluster) # add player clusters 
+cluster1_var <- round(pca_summary$importance[2,1], 4) * 100 # get variance explained by cluster 1
+cluster2_var <- round(pca_summary$importance[2,2], 4) * 100 # get variance explained by cluster 2
+
+# how different are the clusters when scaled down to two dimensions? 
+pc2 %>% 
+  ggplot(aes(x=PC1, y=PC2, color=Cluster, shape=Cluster)) + 
+  geom_point(alpha=0.3) + 
+  scale_color_futurama() + # fun color scale
+  geom_rug() + # great way to visualize points on a single axis
+  theme_minimal() + stat_ellipse(level=(2/3)) + # set ellipse value to one standard deviation
+  scale_shape_manual(values=seq(0,15)) + 
+  labs(x = paste0('PC1 (Accounts for ', cluster1_var, '% of Variance)'), # define cluster 1 % of variance
+       y = paste0('PC2 (Accounts for ', cluster2_var, '% of Variance'), # define cluster 2 % of variance
+       title = 'Visualizing K-Means Cluster Differences in 2D') + 
+  theme_stern()
+```
+
+## Gaussian Mixture Models
+While K-Means is extremely popular and useful, Gaussian Mixture Models make some notable improvements over it. The Gaussian part implies a Gaussian (or Normal) distribution for each cluster, instead of just a vector of means within each predictor variable. This means that each cluster has both a mean and variance. The addition of variance gives a much better idea of how tight or spread out the cluster is in each dimension. As well, it gives you a sense of just how different each observation is from the center of the cluster. Using mean and variance, each point can be assigned a *soft* assignment. Instead of simply assigning each point to a cluster, each point has a probability of belonging to each cluster. When making hard assignments, you simply assign each point to the cluster it has the highest probability of being in. Similar to K-Means, the two repeated steps of the Gaussian Mixture Model (GMM) algorithm are:
+
+1. Obtain standardized soft assignments of each observation to each cluster based on its mean and variance. This is a vector of probabilities which sum to $1.00$ for each observation. 
+2. Update cluster mean and variances based on new soft assignments. 
+
+The GMM algorithm also determines on its own the optimal number of clusters to choose, minimizing operator error. 
+
+```{r}
+# run GMM on the scaled data from above
+set.seed(22)
+mixture_model <-  Mclust(X)
+mix_model_summary <- summary(mixture_model) # obtain model summary
+mix_model_summary
+```
+
+The GMM defines eight clusters of NBA players. What do each of these clusters look like? Which players' seasons best represent these clusters (have the highest probability of belonging to their final cluster assignment)?
+```{r}
+# get cluster centers
+mbc_centers <- mixture_model$parameters$mean %>%
+  t() %>%
+  as.data.frame()
+
+# name clusters
+mbc_centers$Cluster <- c('Cluster 1', 'Cluster 2', 'Cluster 3',
+                       'Cluster 4', 'Cluster 5', 'Cluster 6',
+                       'Cluster 7') 
+
+# rename predictors for easier plotting
+mbc_centers <- mbc_centers %>%
+  rename(c('AST'='astPerMinute', 'BLK'='blkPerMinute',
+           'DRB'='drbPerMinute', '2PA'='fg2aPerMinute',
+           '3PA'='fg3aPerMinute', 'FTA'='ftaPerMinute',
+           'ORB'='orbPerMinute',
+           'PTS'='ptsPerMinute', 'STL'='stlPerMinute',
+           'TOV'='tovPerMinute', 'FT%'='pctFT',
+           '2P%'='pctFG2', '3P%'='pctFG3',
+           'LEAP'='verticalLeapMaxInches', 'AGL'='timeLaneAgility',
+           'STR'='repsBenchPress135')) %>%
+  # pivot for easier plotting
+  pivot_longer(!Cluster, names_to = 'feature', values_to = 'z_val')
+
+# reorder predictor variables
+mbc_centers$feature <- factor(mbc_centers$feature, levels=c('PTS', 'AST','ORB',
+                                                            'DRB', 'STL','BLK',
+                                                            'TOV','2PA', '3PA',
+                                                            'FTA','2P%', '3P%',
+                                                            'FT%', 'LEAP', 
+                                                            'AGL', 'STR'))
+
+mix_model_preds <- as.data.frame(predict(mixture_model, X)) # provides class probabilities
+mix_model_augment <- augment(mixture_model, X) # .class gives MAP class label 
+mix_model_augment$idPlayerNBA <- player_stats$idPlayerNBA # add player ID
+mix_model_augment$namePlayer <- player_stats$namePlayer # add player name
+mix_model_augment$yearSeason <- player_stats$yearSeason # add season
+mix_model_augment$slugTeamBREF <- player_stats$slugTeamBREF # add player team
+```
+
+```{r warning=FALSE}
+# changing the .class assignment in this chunk of code allows you to explore the players with the highest probability of belonging to that cluster
+mix_model_augment %>%
+  dplyr::select(idPlayerNBA, yearSeason, namePlayer, .class, .uncertainty) %>% # select columns describing the player / cluster
+  dplyr::filter(.class==7) %>% # filter to an individual cluster
+  arrange(-.uncertainty) %>% # sort by probability
+  head(5)
+```
+
+These aren't necessarily the "best" players in each cluster, but are the most representative of the clusters defined by the GMM:
+
+* Cluster 1: 2010 DeMar DeRozan, 2013 Chris Bosh, 2015 Nene
+* Cluster 2: 2014 Marcin Gortat, 2015 Cody Zeller, 2016 LaMarcus Aldridge
+* Cluster 3: 2010 JJ Redick, 2014 Damian Lillard, 2018 Khris Middleton
+* Cluster 4: 2015/16 Carmelo Anthony, 2016/18 Jeff Green
+* Cluster 5: 2016 George Hill, 2017 Kentavious Caldwell-Pope, 2019 Terry Rozier
+* Cluster 6: 2011/16 Rudy Gay, 2015 Otto Porter Jr., 2018 Maurice Harkless
+* Cluster 7: 2013 JR Smith, 2014 Nick Young, 2019/20 CJ McCollum
+
+Knowing these players, can you guess what these clusters might look like? 
+```{r warning=FALSE}
+mbc_centers %>% 
+  ggplot(aes(x=feature, y=z_val, color=Cluster)) + 
+  geom_point() + geom_line() + 
+  scale_color_manual(values = pal_npg()(7)) + # call 8-color palette
+  gghighlight(use_direct_label = FALSE) + # highlight each cluster
+  facet_wrap(~ Cluster) + # plot each cluster seperately
+  labs(x = "Feature", y = "Scaled Group Score", 
+       title = "Visualizing Model Based Cluster Makeups") + 
+  theme_minimal() + theme_stern() + 
+  theme(legend.position = "none", strip.text = element_text(face='bold'),
+        axis.text.x = element_text(angle=90, size=8), # make axis labels less cramped 
+        panel.grid.minor = element_blank()) 
+```
+
+This plot allows you to get an idea of different player archetypes that exist in the modern game and how they contribute to the play style around them. 
+
+Cluster 1: 
+
+* Rebound well on both sides of the ball
+* Shot blockers
+* Shoot almost exclusively 2s and get fouled a fair amount on them
+* Both agile and strong
+
+Cluster 2: 
+
+* Rarely contribute to offensive scoring
+* An extreme version of Cluster 1:
+    - Better rebounders
+    - Better blockers
+    - Worse 3pt and free throw shooters
+    - Stronger, more agile
+
+Cluster 3: 
+
+* Team's offense runs through them when they're on the floor:
+    - Highest volume scorers in the league
+    - More assists than anyone else
+* Rarely rebound
+* Not agile or strong
+
+Cluster 4: 
+
+* Decent rebounders
+* Very average in most categories
+    - Average number of 2pt and 3pt shots
+    - Some strength, agility
+* Very solid 3pt shooters
+
+Cluster 5: 
+
+* Rarely score, assist, rebound, or turn the ball over
+* Shoots almost exclusively 3s and are quite good at them
+* Solid vertical and strength
+
+Cluster 6: 
+
+* Low volume scorer
+* Good rebounder, especially on offense
+
+Cluster 7: 
+
+* Solid shooter, better from 3 than 2 (relative to other players)
+* High number of assists
+* Very few rebounds
+* Good vertical 
+
+Principal Component Analysis can be used again to visualize these clusters in the two dimensions which account for the majority of variance between players. How does this differ from the same plot for the K-Means clusters above? It was mentioned above that Cluster 2 was extremely similar to Cluster 1 but more extreme. Can you spot this same trend in the plot below? 
+```{r}
+pc2 <- as.data.frame(pca$x[,1:2]) # extract first two PCs 
+pc2$Cluster <- as.factor(mix_model_augment$.class) # add player clusters 
+pc2$team <- player_stats$slugTeamBREF # add player team
+pc2$pos <- player_stats$groupPosition # add player position
+pc2$yr <- player_stats$yearSeason # add season
+
+pc2 %>% 
+  ggplot(aes(x=PC1, y=PC2, color=Cluster, shape=Cluster)) + 
+  geom_point(alpha=0.5) +
+  scale_color_manual(values = pal_npg()(7)) + 
+  geom_rug() + theme_minimal() + 
+  stat_ellipse(level=(2/3)) + # set ellipse value to one standard deviation
+  scale_shape_manual(values=seq(0,7)) +
+  theme_stern() + 
+  labs(x = paste0('PC1 (Accounts for ', cluster1_var, '% of Variance)'),
+       y = paste0('PC2 (Accounts for ', cluster2_var, '% of Variance'),
+       title = 'Visualizing Model Based Cluster Differences in 2D') 
+```
+
+They say the center position is dying and that they likley won't get paid as much in the coming decade. Yet, Nikola Jokic is one of the best players in the league and a threat to put up a double-double, if not triple-double, every single night. How is this possible? Because Jokic is not a traditional center. His play style is completely different from that of Andre Drummond. Any player classification system which equates the two cannot possibly be useful for describing players or the makeup of teams. Another way to visualize these new player clusters is by highlighting their conventional position groups. Some of these clusters are subsets of traditional positions and others span multiple. This is further evidence that the positional groupings currently used are inadequate. 
+```{r warning=FALSE}
+pc2 %>% 
+  dplyr::mutate(pos = case_when( # rename positional groups
+    pos=='C'~'Centers',
+    pos=='G'~'Guards',
+    pos=='F'~'Forwards')) %>%
+  ggplot(aes(x=PC1, y=PC2, color=Cluster, shape=Cluster)) + 
+  geom_point(alpha=0.5) + 
+  gghighlight(label_key=pos) + # highlight position
+  scale_color_manual(values = c(pal_npg()(7), "#CC79A7")) + 
+  theme_minimal() + 
+  scale_shape_manual(values=seq(0,7)) +
+  facet_wrap(~ pos, ncol=3) + # seperate plots for position
+  stat_ellipse(level=(2/3)) + 
+  theme_stern() + 
+  labs(x = paste0('PC1 (Accounts for ', cluster1_var, '% of Variance)'),
+       y = paste0('PC2 (Accounts for ', cluster2_var, '% of Variance'),
+       title = 'Visualizing Model Based Cluster Differences in 2D') + 
+  theme(legend.position = 'none', # remove legend
+        strip.text = element_text(face='bold', color="#232D4B", size=10))
+```
+
+## Networks/Graphs
+Networks, also known as Graphs, are a completely different way of representing data. Each *node* refers to a data point and may contain some attributes. Each node is connected to other nodes via *edges*. An edge is either directed, meaning the connection only flows from one node to the other but not vice versa, or undirected, meaning the connection is bi-directional. Edges can also have *weights* which are usually some measure of the strength of said connection. When solving graphical problems where nodes are locations, edge weights are often the distances between locations or the amount of fuel it takes to get from the first node to the second, for example. 
+
+In this case, each player will be a node. Every player will be connected to every other player via an edge. Using the probability that each player belongs to each of the eight GMM clusters, you can calculate a distance metric which describes how different each player is from one another. Players that not only have the same cluster assignment, but also similar probabilities of belonging to the other seven clusters, will have the smallest distance between them. Players could be in the same cluster but have very different probabilities of belonging to other clusters and therefore be quite different players. The soft classification property of GMMs is what allows us to do this, generating an extremely unique and interesting way of describing the differences between players. This 8-dimensional distance, calculated using the same euclidean distance formula from the beginning of this tutorial, will serve as the weights of the edges between each of the players. This is exactly as computationally expensive as it sounds. For any group of $n$ players, $\frac{(n^2 - n)}{2}$ seperate distance calculations must be performed in order to set this network up properly. Therefore, this dataset must be subset to only the $2019$ NBA season to make the runtime of this document more reasonable. 
+
+```{r warning=FALSE}
+# n-dimensional distance calculation between two vectors
+n_dist <- function(a, b) {
+  return (sqrt(sum((a - b)^2)))
+}
+
+# subset to 2019 season
+mma <- mix_model_augment %>%
+  dplyr::select(idPlayerNBA, yearSeason, slugTeamBREF, namePlayer, .class, .uncertainty) %>%
+  cbind(dplyr::select(mix_model_preds, -classification)) %>% # get soft classification probabilities for each cluster
+  dplyr::filter(yearSeason==2019) # filter to 2019 season
+
+nodes <- data_frame(nodes = mma$idPlayerNBA, # nodes are unique NBA IDs
+                       group = mma$.class, # hard cluster classification 
+                    team=mma$slugTeamBREF, # player team
+                    name = mma$namePlayer) # player name
+
+# initialize edges df
+edges <- data_frame()
+# loop through nodes twice
+for (i in 1:nrow(nodes)) {
+  for (j in 1:nrow(nodes)) {
+    if (i > j) { # no need to perform distance calculations twice b/c the graph is undirected 
+      edges <- rbind(edges, data_frame(from=as.character(nodes[i,'nodes']), # first player id
+                                       to=as.character(nodes[j,'nodes']), # second player id
+                                       weight=n_dist(mma[i,6:13], mma[j,6:13]))) # distance calculation
+    }
+  }
+}
+```
+
+## Minimum Spanning Tree
+The minimum spanning tree (MST) is a common problem in network analysis and graph theory. It takes any graph with undirected edges and removes as many of those edges as it can, while still keeping the graph fully connected. This means that you can still get from one node to any other node by traversing the remaining edges. The minimum part means that the weights of the edges which are kept sum to have the smallest total weight possible. For this problem, reducing the extremely large graph above to an MST would ensure that only the most similar of players remain connected to each other. This is a great way to visualize not just which clusters are most similar, but which observations in (and between) each cluster are most similar. 
+```{r}
+g <- graph_from_data_frame(d=edges, vertices=nodes, directed=FALSE) # create graph using edges and nodes
+mst_g <- mst(g) # reduce graph to an MST
+set.seed(30) # ensures reproducability 30, 42
+# obtain a layout for the graph (there are many other graphical layouts out there worth exploring further)
+g_layout <- layout_with_lgl(mst_g) 
+
+# players to showcase
+player_vec <- c('Mike Scott', 'Jimmy Butler', 'Tobias Harris', 'Klay Thompson',
+                'Bradley Beal', 'DeAndre Jordan', 'James Harden', 'Steven Adams',
+                'LaMarcus Aldridge', 'Hassan Whiteside', 'Gordon Hayward', 
+                'Robert Covington', 'Kelly Oubre Jr.', 'Bam Adebayo', 'Allen Crabbe',
+                'DeMar DeRozan', 'Kevin Huerter', 'Blake Griffin', 'Brook Lopez',
+                'John Collins', 'Dennis Schroder', 'Donovan Mitchell',
+                'Stephen Curry', 'James Harden', 'Jared Dudley', 'Kentavious Caldwell-Pope',
+                'Jae Crowder', 'Bruce Brown', 'Thomas Bryant', 'John Collins',
+                'Mike Conley', 'Victor Oladipo', 'Draymond Green', 'Terry Rozier')
+
+# aesthetic modifications to player names (distance from node and orientation)
+name_vec <- tibble(p_name=vertex_attr(g, "name")) %>%
+  dplyr::mutate(p_name = ifelse(p_name %in% player_vec, p_name, NA), # display player name
+                b_color = ifelse(p_name%in% player_vec, 'yellow', 'black'), # color defined players yellow
+                v_deg = case_when( # identify player names moving vertically
+                  p_name%in%c('James Harden', 'Klay Thompson',
+                              'Kevin Huerter', 'Jared Dudley', 'Gordon Hayward',
+                              'Bruce Brown', 'Brook Lopez', 'John Collins',
+                              'Mike Conley', 'Draymond Green', 'Terry Rozier')~pi/2,
+                 TRUE~0),
+                v_dist = case_when( # set distance from player name to node
+                  p_name=='Bam Adebayo'~2, p_name=='LaMarcus Aldridge'~2.5,
+                  p_name=='Hassan Whiteside'~-2.3, p_name=='Steven Adams'~-2,
+                  p_name=='DeAndre Jordan'~-2.2, p_name=='James Harden'~.7,
+                  p_name=='Stephen Curry'~-2.1, p_name=='Kevin Huerter'~-.7,
+                  p_name=='Jared Dudley'~-.7, p_name=='Kentavious Caldwell-Pope'~3.2,
+                  p_name=='Robert Covington'~2.3, p_name=='Jae Crowder'~-1.9,
+                  p_name=='Kelly Oubre Jr.'~2.2, p_name=='Mike Scott'~-1.7,
+                  p_name=='Donovan Mitchell'~2.3, p_name=='Jimmy Butler'~-2,
+                  p_name=='Dennis Schroder'~-2.2, p_name=='Bruce Brown'~-.7,
+                  p_name=='Brook Lopez'~.7, p_name=='DeMar DeRozan'~2.3,
+                  p_name=='Blake Griffin'~1.9, p_name=='Thomas Bryant'~2.1,
+                  p_name=='Klay Thompson'~.7, p_name=='Gordon Hayward'~.7,
+                  p_name=='John Collins'~.6, p_name=='Bradley Beal'~-1.8,
+                  p_name=='Mike Conley'~.65, p_name=='Tobias Harris'~2,
+                  p_name=='Victor Oladipo'~-2, p_name=='Draymond Green'~-.6,
+                  p_name=='Terry Rozier'~.7, p_name=='Allen Crabbe'~1.8,
+                  TRUE~0))
+
+par(family='Tahoma', col="#232D4B", col.main="#232D4B", mar=c(0,0,2,0)) # set overall plot specifications
+# graph plotting help from: https://kateto.net/netscix2016.html 
+plot(mst_g, layout=g_layout, main="2019 NBA Player Cluster Network (MST)",
+     vertex.size=5, vertex.label=name_vec$p_name, # vertex_attr(g, "name"), # include certain player names
+     frame=FALSE, edge.width=3,
+     vertex.frame.color = name_vec$b_color, # set node frame color
+     vertex.label.dist=name_vec$v_dist, # set name distance from node
+     vertex.label.degree=name_vec$v_deg, # set orientation of name w/ respect to node
+     vertex.label.color="#232D4B", # text color
+     vertex.label.font=2, # make player names bold
+     vertex.label.cex=.4, # set name sizes 
+     vertex.color=pal_npg()(7)[as.numeric(as.factor(vertex_attr(g, "group")))]) # assign node colors to GMM clusters
+
+# legend for cluster colors
+legend(x=1.2, y=1.1, c('Cluster 1', 'Cluster 2', 'Cluster 3', 'Cluster 4',
+                          'Cluster 5', 'Cluster 6', 'Cluster 7'), pch=21,
+       pt.bg=pal_npg()(7), pt.cex=1.5, bty="n", ncol=1, cex=.8)
+```
+
+## How can you use this? 
+I encourage everyone who made it this far to try out each section of the tutorial themselves. Anyone can scrape the same data used above, as well as dozens of other variables this tutorial did not feature. This tutorial went over implementing two different clustering methods (K-Means and Gaussian Mixture Modeling), dimensionality reduction, and graphical networks. Explore the K-Means algorithm and experiment with any different number of clusters. GMM's have a variety of manual tweaks available, including the shape the multidimensional Gaussians can take and how different they can be from each other. Networks come with dozens of different types of layouts for visualization which can give you an entirely new persepctive on your data. With greater computational resources and time, the network analysis portion of this would be perfect for finding historical player comparisons for young players, allowing us to project their growth in an entirely new fashion. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
